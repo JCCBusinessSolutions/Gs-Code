@@ -63,7 +63,7 @@ const TRIGGER_CODE_VERSION = '2026-08-18-v2';
 // behind. Bump this string any time a real, user-facing Code.gs
 // change ships — and update the matching value in the hosted
 // update-status JSON at the same time, or this check does nothing.
-const CODE_GS_VERSION = '2026-09-12-v1';
+const CODE_GS_VERSION = '2026-09-16-v1'; // bumped: Recurring Broadcast Email feature added
 
 // Shared by every trigger self-heal below. Deletes any existing
 // trigger(s) for the given handler function if the stored version
@@ -107,6 +107,29 @@ const SCHEDULE_HEADERS = ['Schedule ID','Scheduled For','Subject','PayloadJSON',
 // Scheduled Broadcasts, since the same size constraints apply.
 const DRAFT_SHEET_NAME = 'Broadcast Drafts';
 const DRAFT_HEADERS = ['Draft ID','Subject','PayloadJSON','Created At','Updated At'];
+
+// Recurring Broadcasts: one row per campaign, checked by a single
+// shared hourly trigger (runRecurringBroadcastsCheck) rather than a
+// trigger per campaign — Apps Script hard-caps every project at 20
+// total triggers, and a recurring send can never self-delete the way
+// a one-time scheduled send does, so giving each campaign its own
+// trigger would permanently burn a slot per campaign. Anchor Date
+// never changes after creation; Next Send Date is recalculated
+// forward from it every time this fires, so the schedule never drifts
+// even after months/years of running (see computeNextSendDate_).
+const RECURRING_SHEET_NAME = 'Recurring Broadcasts';
+const RECURRING_HEADERS = ['Recurring ID','Status','Subject','PayloadJSON','Frequency','Anchor Date','Next Send Date','Last Sent Date','HistoryJSON','Created At','Last Error'];
+const RECURRING_HISTORY_CAP = 20; // keep each row's send-history JSON bounded
+// Same budget pattern as SCHEDULED_BROADCAST_MAX_RUNTIME_MS — leaves a
+// safety margin under Apps Script's 6-minute execution cap for a
+// consumer Gmail account (Workspace gets 30 min, but this stays
+// conservative for both) so the hourly run can gracefully stop and let
+// the NEXT hourly tick finish anything left over, rather than risk an
+// abrupt mid-batch timeout that could leave a row in an inconsistent
+// state. A row left unprocessed this way simply stays "due" and gets
+// picked up automatically on the very next run — nothing is dropped,
+// worst case a send lands up to ~1 hour later than its exact slot.
+const RECURRING_CHECK_MAX_RUNTIME_MS = 4.5 * 60 * 1000;
 
 const CONFIG_DEFAULTS = {
   senderName: '',
@@ -925,6 +948,7 @@ function watchdogEnsureTriggers(){
   ensureDailyReminderTriggerExists();
   ensureAnniversaryDailyTriggerExists();
   ensureBirthdayDailyTriggerExists();
+  ensureRecurringBroadcastHourlyTriggerExists();
 }
 
 // Self-installs once, same idempotent pattern as every other trigger
@@ -941,6 +965,32 @@ function ensureWatchdogTriggerExists(){
   try{
     _rebuildTriggerIfStale('watchdogEnsureTriggers', () => {
       ScriptApp.newTrigger('watchdogEnsureTriggers')
+        .timeBased()
+        .everyHours(1)
+        .create();
+    });
+  }finally{
+    lock.releaseLock();
+  }
+}
+
+// The ONE new standing trigger the Recurring Broadcast feature ever
+// needs — hourly, checking "is any recurring campaign due this hour?"
+// against the Recurring Broadcasts sheet. Whether an advisor has 1
+// recurring campaign or 20, this stays a single trigger, so standing
+// trigger count goes from 5 \u2192 6 permanently and never grows with
+// campaign count. Same idempotent lock + version-aware pattern as
+// every other trigger installer above.
+function ensureRecurringBroadcastHourlyTriggerExists(){
+  const lock = LockService.getScriptLock();
+  try{
+    lock.waitLock(3000);
+  }catch(e){
+    return;
+  }
+  try{
+    _rebuildTriggerIfStale('runRecurringBroadcastsCheck', () => {
+      ScriptApp.newTrigger('runRecurringBroadcastsCheck')
         .timeBased()
         .everyHours(1)
         .create();
@@ -1094,6 +1144,7 @@ function doGet(e){
   ensureAnniversaryDailyTriggerExists();
   ensureBirthdayDailyTriggerExists();
   ensureWatchdogTriggerExists(); // second, independent layer — catches a missing trigger within an hour even on a day nobody opens the app
+  ensureRecurringBroadcastHourlyTriggerExists();
   if (!ACTIONS_EXEMPT_FROM_HARD_STOP.includes(action) && !isAdvisorActive()){
     return jsonResponse(Object.assign({ error: 'ADVISOR_INACTIVE' }, getAdvisorActiveStatus()));
   }
@@ -1162,6 +1213,7 @@ function doGet(e){
   if (action === 'getAdvanceDays')            return jsonResponse(getAdvanceDays());
   if (action === 'diagnoseTemplateSize')      return jsonResponse(diagnoseTemplateSize());
   if (action === 'getScheduledBroadcasts')    return jsonResponse({ schedules: getScheduledBroadcasts() });
+  if (action === 'getRecurringBroadcasts')    return jsonResponse({ campaigns: getRecurringBroadcasts() });
   if (action === 'getSentEmailsForSubject')   return getSentEmailsForSubject(e.parameter.subject || '');
   if (action === 'getDrafts')                 return jsonResponse({ drafts: getDrafts() });
   if (action === 'getLastUploadDates')        return jsonResponse(getLastUploadDates());
@@ -1313,6 +1365,7 @@ function doPost(e){
   ensureAnniversaryDailyTriggerExists();
   ensureBirthdayDailyTriggerExists();
   ensureWatchdogTriggerExists();
+  ensureRecurringBroadcastHourlyTriggerExists();
 
   if (!ACTIONS_EXEMPT_FROM_HARD_STOP.includes(body.action) && !isAdvisorActive()){
     return jsonResponse(Object.assign({ error: 'ADVISOR_INACTIVE' }, getAdvisorActiveStatus()));
@@ -1341,6 +1394,12 @@ function doPost(e){
   if (body.action === 'deleteCompletedBroadcast') { try{ return jsonResponse(deleteCompletedBroadcast(body.scheduleId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'annotateResendOnSchedule') { try{ return jsonResponse(annotateResendOnSchedule(body.scheduleId, body.sentCount, body.failedCount)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'getScheduledBroadcasts') { try{ return jsonResponse({ schedules: getScheduledBroadcasts() }); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
+  if (body.action === 'createRecurringBroadcast') { try{ return jsonResponse(createRecurringBroadcast(body.frequency, body.anchorDate, body.payload)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
+  if (body.action === 'getRecurringBroadcasts')   { try{ return jsonResponse({ campaigns: getRecurringBroadcasts() }); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
+  if (body.action === 'pauseRecurringBroadcast')  { try{ return jsonResponse(setRecurringBroadcastStatus(body.recurringId, 'paused')); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
+  if (body.action === 'resumeRecurringBroadcast') { try{ return jsonResponse(setRecurringBroadcastStatus(body.recurringId, 'active')); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
+  if (body.action === 'deleteRecurringBroadcast') { try{ return jsonResponse(deleteRecurringBroadcast(body.recurringId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
+  if (body.action === 'testSendRecurringBroadcast') { try{ return jsonResponse(testSendRecurringBroadcast(body.recurringId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'saveDraft')              { try{ return jsonResponse(saveDraft(body.draftId, body.payload)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'getDrafts')              { try{ return jsonResponse({ drafts: getDrafts() }); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'deleteDraft')            { try{ return jsonResponse(deleteDraft(body.draftId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
@@ -2789,6 +2848,335 @@ function annotateResendOnSchedule(scheduleId, resendSentCount, resendFailedCount
     }
   }
   return { success: false, error: 'Original schedule not found (it may have been deleted).' };
+}
+
+/* ============================================================
+   RECURRING BROADCASTS
+   ------------------------------------------------------------
+   Never gets its own per-campaign trigger (see the 20-trigger note
+   on RECURRING_SHEET_NAME above and ensureRecurringBroadcastHourly-
+   TriggerExists) — the single shared hourly trigger below checks
+   every Active row and sends whichever ones are due.
+   ============================================================ */
+
+function setupRecurringSheet(){
+  const ss = getSpreadsheet();
+  let sheet = ss.getSheetByName(RECURRING_SHEET_NAME);
+  if (!sheet){
+    sheet = ss.insertSheet(RECURRING_SHEET_NAME);
+  }
+  if (sheet.getLastRow() === 0){
+    sheet.appendRow(RECURRING_HEADERS);
+    sheet.setFrozenRows(1);
+  } else {
+    // Same forward-compatible pattern as setupScheduleSheet — append
+    // any headers missing on an existing sheet rather than inserting
+    // mid-row, so nothing already stored shifts column.
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    RECURRING_HEADERS.forEach(h => {
+      if (!headers.includes(h)){
+        sheet.getRange(1, sheet.getLastColumn() + 1).setValue(h);
+      }
+    });
+  }
+  return sheet;
+}
+
+// Computes the next send moment strictly after `fromDate`, anchored to
+// `anchorDate` — walking forward in whole frequency units from the
+// original anchor rather than adding an interval to "whenever it last
+// sent." Confirmed no-drift design: anchor = Jan 15, quarterly \u2192
+// Jan 15, Apr 15, Jul 15, Oct 15, Jan 15... forever, with zero creep.
+// Month-length edge case: if the anchor day doesn't exist in the
+// target month (e.g. anchored on the 31st, target month has 30 or
+// fewer days), falls back to the last day of that month — standard
+// subscription-billing behavior.
+function computeNextSendDate_(anchorDate, frequency, fromDate){
+  const anchorDay = anchorDate.getDate();
+  const anchorHour = anchorDate.getHours();
+
+  function stepMonths(monthsDelta){
+    const year = anchorDate.getFullYear();
+    const month = anchorDate.getMonth() + monthsDelta;
+    const targetYear = year + Math.floor(month / 12);
+    const targetMonth = ((month % 12) + 12) % 12;
+    const lastDayOfTargetMonth = new Date(targetYear, targetMonth + 1, 0).getDate();
+    const day = Math.min(anchorDay, lastDayOfTargetMonth);
+    return new Date(targetYear, targetMonth, day, anchorHour, 0, 0, 0);
+  }
+
+  if (frequency === 'daily'){
+    const msPerDay = 24 * 60 * 60 * 1000;
+    if (anchorDate.getTime() > fromDate.getTime()) return new Date(anchorDate.getTime());
+    const daysElapsed = Math.floor((fromDate.getTime() - anchorDate.getTime()) / msPerDay) + 1;
+    return new Date(anchorDate.getTime() + daysElapsed * msPerDay);
+  }
+
+  if (frequency === 'weekly'){
+    const msPerWeek = 7 * 24 * 60 * 60 * 1000;
+    if (anchorDate.getTime() > fromDate.getTime()) return new Date(anchorDate.getTime());
+    const weeksElapsed = Math.floor((fromDate.getTime() - anchorDate.getTime()) / msPerWeek) + 1;
+    return new Date(anchorDate.getTime() + weeksElapsed * msPerWeek);
+  }
+
+  const stepSize = frequency === 'monthly' ? 1 : frequency === 'quarterly' ? 3 : frequency === 'annually' ? 12 : null;
+  if (stepSize === null) throw new Error('Unknown recurring frequency: ' + frequency);
+
+  // Jump straight to an approximate month-block count via calendar math
+  // (not a fixed-step walk), then correct by at most a couple of steps
+  // either direction. This stays correct — and fast — even for an
+  // anchor that's years stale (e.g. an account reactivated after a long
+  // inactivity lock), instead of assuming a capped number of steps.
+  const monthsDiff = (fromDate.getFullYear() - anchorDate.getFullYear()) * 12 + (fromDate.getMonth() - anchorDate.getMonth());
+  let k = Math.max(0, Math.floor(monthsDiff / stepSize));
+  let candidate = stepMonths(stepSize * k);
+  let guard = 0; // hard safety stop — real-world correction is always 0-2 iterations
+  while (candidate.getTime() <= fromDate.getTime() && guard < 10){
+    k++;
+    candidate = stepMonths(stepSize * k);
+    guard++;
+  }
+  while (k > 0 && guard < 20){
+    const prevCandidate = stepMonths(stepSize * (k - 1));
+    if (prevCandidate.getTime() <= fromDate.getTime()) break;
+    candidate = prevCandidate;
+    k--;
+    guard++;
+  }
+  return candidate;
+}
+
+function createRecurringBroadcast(frequency, anchorDateIso, payload){
+  if (['daily','weekly','monthly','quarterly','annually'].indexOf(frequency) === -1){
+    throw new Error('Invalid frequency: ' + frequency);
+  }
+  const anchorDate = new Date(anchorDateIso);
+  if (isNaN(anchorDate.getTime())) throw new Error('Invalid anchor date.');
+
+  const sheet = setupRecurringSheet();
+  const recurringId = Utilities.getUuid();
+  const now = new Date();
+  const nextSendDate = computeNextSendDate_(anchorDate, frequency, now);
+
+  sheet.appendRow([
+    recurringId,
+    'active',
+    payload && payload.subject || '',
+    JSON.stringify(payload || {}),
+    frequency,
+    anchorDate,
+    nextSendDate,
+    '',
+    JSON.stringify([]),
+    now,
+    ''
+  ]);
+
+  return { success: true, recurringId: recurringId, nextSendDate: nextSendDate.toISOString() };
+}
+
+function getRecurringBroadcasts(){
+  const sheet = setupRecurringSheet();
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const col = name => headers.indexOf(name);
+  const result = [];
+  for (let i = 1; i < data.length; i++){
+    const row = data[i];
+    if (!row[col('Recurring ID')]) continue; // skip any blank trailing row
+    let history = [];
+    try{ history = JSON.parse(row[col('HistoryJSON')] || '[]'); }catch(e){}
+    result.push({
+      recurringId: row[col('Recurring ID')],
+      status: row[col('Status')] || 'active',
+      subject: row[col('Subject')],
+      frequency: row[col('Frequency')],
+      anchorDate: row[col('Anchor Date')] instanceof Date ? row[col('Anchor Date')].toISOString() : String(row[col('Anchor Date')] || ''),
+      nextSendDate: row[col('Next Send Date')] instanceof Date ? row[col('Next Send Date')].toISOString() : String(row[col('Next Send Date')] || ''),
+      lastSentDate: row[col('Last Sent Date')] instanceof Date ? row[col('Last Sent Date')].toISOString() : String(row[col('Last Sent Date')] || ''),
+      createdAt: row[col('Created At')] instanceof Date ? row[col('Created At')].toISOString() : String(row[col('Created At')] || ''),
+      lastError: row[col('Last Error')] || '',
+      // Field names (sentCount/failedCount) match what the frontend's
+      // refreshRecurringBroadcastsList already expects, even though
+      // sendBroadcastEmailBatch itself returns sent/failed — mapped
+      // once here rather than renaming on every write below.
+      history: history.slice().reverse().map(h => ({ sentAt: h.sentAt, sentCount: h.sent, failedCount: h.failed }))
+    });
+  }
+  result.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return result;
+}
+
+function setRecurringBroadcastStatus(recurringId, newStatus){
+  const sheet = setupRecurringSheet();
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const col = name => headers.indexOf(name);
+
+  for (let i = 1; i < data.length; i++){
+    if (String(data[i][col('Recurring ID')]) === String(recurringId)){
+      const rowNum = i + 1;
+      sheet.getRange(rowNum, col('Status') + 1).setValue(newStatus);
+      // Resuming recalculates Next Send Date forward from the anchor
+      // (not from whenever it was paused), so a long pause doesn't
+      // cause a burst of "catch-up" sends — it just resumes cleanly on
+      // the next natural anchor-aligned slot.
+      if (newStatus === 'active'){
+        const anchorDate = new Date(data[i][col('Anchor Date')]);
+        const frequency = data[i][col('Frequency')];
+        const newNextSend = computeNextSendDate_(anchorDate, frequency, new Date());
+        sheet.getRange(rowNum, col('Next Send Date') + 1).setValue(newNextSend);
+      }
+      return { success: true };
+    }
+  }
+  return { success: false, error: 'Recurring campaign not found.' };
+}
+
+function deleteRecurringBroadcast(recurringId){
+  const sheet = setupRecurringSheet();
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const col = name => headers.indexOf(name);
+
+  for (let i = 1; i < data.length; i++){
+    if (String(data[i][col('Recurring ID')]) === String(recurringId)){
+      sheet.deleteRow(i + 1);
+      return { success: true };
+    }
+  }
+  return { success: false, error: 'Recurring campaign not found.' };
+}
+
+// Fires the campaign's exact saved message once, right now, to the
+// advisor's own Contact Email — same "test to self" convention as
+// sendDuesTestEmailToSelf/sendBirthdayTestEmailToSelf/sendAnniversary-
+// TestEmailToSelf. Never touches Next Send Date, Last Sent Date, or
+// History — this is a preview send, completely outside the recurring
+// schedule, so it can't push a real send early or throw off the
+// anchor-based date math.
+function testSendRecurringBroadcast(recurringId){
+  const config = getBrandConfig();
+  assertConfigured(config);
+  const recipient = config.contactEmail;
+  if (!recipient) throw new Error('Please set a Contact Email in Your Branding first, then try the test send again.');
+
+  const sheet = setupRecurringSheet();
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const col = name => headers.indexOf(name);
+
+  for (let i = 1; i < data.length; i++){
+    if (String(data[i][col('Recurring ID')]) === String(recurringId)){
+      const payload = JSON.parse(data[i][col('PayloadJSON')] || '{}');
+      const testSubject = 'TEST, ' + (payload.subject || '(no subject)');
+      const batchResult = sendBroadcastEmailBatch(
+        [{ email: recipient, clientName: 'Test' }],
+        testSubject,
+        payload.htmlBody || '',
+        payload.attachments || [],
+        payload.useTemplate
+      );
+      if (batchResult.failed > 0 && batchResult.failureReasons && batchResult.failureReasons.length){
+        throw new Error(batchResult.failureReasons[0].reason);
+      }
+      return { success: true, sentTo: recipient };
+    }
+  }
+  return { success: false, error: 'Recurring campaign not found.' };
+}
+
+// The single shared hourly handler — the only new standing trigger
+// this feature ever needs. Reads every Active row, sends the ones due
+// this hour via the same sendBroadcastEmailBatch used by manual and
+// one-time scheduled broadcasts, advances Next Send Date from the
+// anchor, and records Last Sent Date so an overlapping run can't
+// double-send the same slot. Skips entirely on an inactive account —
+// same isAdvisorActive() gate runScheduledBroadcastTrigger already
+// uses — so nothing sends on a stale/locked-out account.
+//
+// Two Apps Script limitations this specifically guards against:
+//  1. Time-based triggers aren't minute-precise (Google's own docs:
+//     up to ~15 min, sometimes up to an hour, of drift) — handled by
+//     treating "Next Send Date" as a due-or-not check (<=  now), not
+//     an exact-moment match, so a late tick still fires correctly.
+//  2. A single execution is capped at 6 minutes (consumer) / 30
+//     minutes (Workspace) — RECURRING_CHECK_MAX_RUNTIME_MS stops this
+//     run before that ceiling and leaves anything left over for the
+//     very next hourly tick, instead of risking an abrupt mid-batch
+//     timeout.
+function runRecurringBroadcastsCheck(){
+  if (!isAdvisorActive()) return;
+
+  const startTime = Date.now();
+  const sheet = setupRecurringSheet();
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const col = name => headers.indexOf(name);
+  const now = new Date();
+
+  for (let i = 1; i < data.length; i++){
+    if (Date.now() - startTime > RECURRING_CHECK_MAX_RUNTIME_MS) break; // remaining due rows retry next hour — see note above
+
+    const row = data[i];
+    if (!row[col('Recurring ID')]) continue;
+    if (row[col('Status')] !== 'active') continue;
+
+    const nextSendDate = row[col('Next Send Date')] ? new Date(row[col('Next Send Date')]) : null;
+    if (!nextSendDate || isNaN(nextSendDate.getTime()) || nextSendDate.getTime() > now.getTime()) continue;
+
+    const lastSent = row[col('Last Sent Date')] ? new Date(row[col('Last Sent Date')]) : null;
+    if (lastSent && !isNaN(lastSent.getTime()) && lastSent.getTime() >= nextSendDate.getTime()) continue; // already sent this slot — guards against an overlapping run
+
+    const rowNum = i + 1;
+    try{
+      const payload = JSON.parse(row[col('PayloadJSON')] || '{}');
+      const batchResult = sendBroadcastEmailBatch(
+        payload.rows || [],
+        payload.subject || '',
+        payload.htmlBody || '',
+        payload.attachments || [],
+        payload.useTemplate
+      );
+
+      const anchorDate = new Date(row[col('Anchor Date')]);
+      const frequency = row[col('Frequency')];
+      const newNextSend = computeNextSendDate_(anchorDate, frequency, now);
+
+      let history = [];
+      try{ history = JSON.parse(row[col('HistoryJSON')] || '[]'); }catch(e){}
+      history.push({ sentAt: now.toISOString(), sent: batchResult.sent, failed: batchResult.failed });
+      if (history.length > RECURRING_HISTORY_CAP) history = history.slice(history.length - RECURRING_HISTORY_CAP);
+
+      sheet.getRange(rowNum, col('Next Send Date') + 1).setValue(newNextSend);
+      sheet.getRange(rowNum, col('Last Sent Date') + 1).setValue(now);
+      sheet.getRange(rowNum, col('HistoryJSON') + 1).setValue(JSON.stringify(history));
+
+      // Send itself succeeded, but individual recipients can still
+      // fail (bad address, quota hit mid-send, etc.) — surface that in
+      // plain English in the same place a hard failure would show, so
+      // "0 failed" vs "send worked but 4 recipients bounced" is never
+      // silently indistinguishable in the UI.
+      if (batchResult.failed > 0 && batchResult.failureReasons && batchResult.failureReasons.length){
+        const summary = batchResult.failureReasons.slice(0, 3).map(fr => fr.email + ': ' + fr.reason).join(' | ') +
+          (batchResult.failureReasons.length > 3 ? ' | +' + (batchResult.failureReasons.length - 3) + ' more' : '');
+        sheet.getRange(rowNum, col('Last Error') + 1).setValue(toEnglishErrorMessage(summary));
+      } else {
+        sheet.getRange(rowNum, col('Last Error') + 1).setValue('');
+      }
+    }catch(err){
+      // A thrown error here means the send never happened at all for
+      // this slot (e.g. branding not configured, message too large) —
+      // NOT advancing Next Send Date is deliberate: it keeps retrying
+      // every hour, and the exact English error is written to the
+      // sheet (and surfaced in the app) so the advisor can fix the
+      // underlying problem, rather than silently missing every future
+      // send until they happen to notice.
+      const englishError = toEnglishErrorMessage(err.message || String(err));
+      sheet.getRange(rowNum, col('Last Error') + 1).setValue(englishError);
+      Logger.log('runRecurringBroadcastsCheck error on row ' + rowNum + ': ' + englishError);
+    }
+  }
 }
 
 /* ============================================================
