@@ -63,7 +63,7 @@ const TRIGGER_CODE_VERSION = '2026-08-18-v2';
 // behind. Bump this string any time a real, user-facing Code.gs
 // change ships — and update the matching value in the hosted
 // update-status JSON at the same time, or this check does nothing.
-const CODE_GS_VERSION = '2026-09-16-v1'; // bumped: Recurring Broadcast Email feature added
+const CODE_GS_VERSION = '2026-09-16-v11'; // bumped: Recurring Broadcast Email feature added
 
 // Shared by every trigger self-heal below. Deletes any existing
 // trigger(s) for the given handler function if the stored version
