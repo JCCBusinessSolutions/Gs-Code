@@ -394,7 +394,7 @@ function buildInactivityReminderEmailHtml(days, config){
   const headerBlock = hasImages ? '<img src="cid:headerImg" alt="Header" style="width:100%;display:block;">' : '';
   const footerBlock = hasImages ? '<img src="cid:footerImg" alt="Footer" style="width:100%;display:block;">' : '';
 
-  return ''
+  return wrapEmailHtmlDocument(''
     + '<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;border:1px solid #E7DFCF;border-radius:10px;overflow:hidden;">'
     + headerBlock
     + '  <div style="padding:24px;background:#FDF8F0;color:#1C2A38;">'
@@ -404,7 +404,7 @@ function buildInactivityReminderEmailHtml(days, config){
     + '    <p style="margin-top:20px;">Simply upload your latest Dues or Birthday list anytime before the deadline to keep everything running without interruption.</p>'
     + '  </div>'
     + footerBlock
-    + '</div>';
+    + '</div>');
 }
 
 function sendInactivityReminderIfNeeded(){
@@ -1775,7 +1775,7 @@ function buildReminderEmailHtml(clientName, policyNumber, product, amount, dueDa
     ? 'Please settle this at your earliest convenience to keep your policy in force. If you have already made this payment, kindly disregard this reminder.'
     : 'Please prepare your payment in advance to keep your policy in force. If you have already made this payment, kindly disregard this reminder.';
 
-  return ''
+  return wrapEmailHtmlDocument(''
     + '<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;border:1px solid #E7DFCF;border-radius:10px;overflow:hidden;">'
     + '  <img src="cid:headerImg" alt="Header" style="width:100%;display:block;">'
     + '  <div style="padding:24px;background:#FDF8F0;color:#1C2A38;">'
@@ -1791,14 +1791,14 @@ function buildReminderEmailHtml(clientName, policyNumber, product, amount, dueDa
     + '    <div style="text-align:center;margin:22px 0;">'
     + '      <a href="' + config.payLink + '" style="display:inline-block;background:#0C447C;color:#FFFFFF;text-decoration:none;padding:14px 30px;border-radius:8px;font-weight:700;font-size:14px;letter-spacing:.5px;">PAY ONLINE NOW</a>'
     + '    </div>'
-    + '    <p style="text-align:center;font-size:14px;margin:20px 0 0;">Would you like to have a 15-Minutes policy review with me online?</p>'
+    + '    <p style="text-align:center;font-size:14px;margin:20px 0 0;">Would you like to have a 15-Minute policy review with me online?</p>'
     + '    <div style="text-align:center;margin:14px 0 6px;">'
     + '      <a href="' + config.connectLink + '" style="display:inline-block;background:#C99A3B;color:#FFFFFF;text-decoration:none;padding:14px 30px;border-radius:8px;font-weight:700;font-size:14px;letter-spacing:.5px;">CONNECT WITH ME</a>'
     + '    </div>'
     + '    <p style="margin-top:20px;">Thank you,</p>'
     + '  </div>'
     + '  <img src="cid:footerImg" alt="Footer" style="width:100%;display:block;">'
-    + '</div>';
+    + '</div>');
 }
 
 function advanceDueDate(sheet, rowNum, col, currentDueDate, premiumMode){
@@ -2282,7 +2282,7 @@ function buildAnniversaryEmailHtml(clientName, years, config){
     ? renderCustomMessageParagraphs(config.anniversaryMessage, { firstname: greetingName, years: yearsText, yearslabel: yearsLabel })
     : defaultAnniversaryBodyHtml;
 
-  return ''
+  return wrapEmailHtmlDocument(''
     + '<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;border:1px solid #E7DFCF;border-radius:10px;overflow:hidden;">'
     + '  <img src="cid:headerImg" alt="Header" style="width:100%;display:block;">'
     + '  <div style="padding:24px;background:#FDF8F0;color:#1C2A38;text-align:center;">'
@@ -2293,7 +2293,7 @@ function buildAnniversaryEmailHtml(clientName, years, config){
     + '    <p style="margin-top:20px;text-align:left;">Warm regards,</p>'
     + '  </div>'
     + '  <img src="cid:footerImg" alt="Footer" style="width:100%;display:block;">'
-    + '</div>';
+    + '</div>');
 }
 
 function previewAnniversaryEmail(){
@@ -2932,16 +2932,49 @@ function toEnglishErrorMessage(rawMessage){
   return msg;
 }
 
+// Wraps an email HTML fragment into a minimal, correctly-declared
+// HTML document before it goes to GmailApp.sendEmail(). Without an
+// explicit charset here, some mail clients (Outlook in particular)
+// ignore the charset GmailApp sets at the MIME/header level and
+// fall back to guessing from the HTML itself -- guessing wrong is
+// exactly what turns emoji and accented characters into
+// diamond-question-mark mojibake on the reader's end, even when the
+// text sent was correctly UTF-8 the whole way. This is defense in
+// depth alongside escapeHtmlForEmail()'s numeric character
+// references above, not a replacement for it.
+function wrapEmailHtmlDocument(bodyHtml){
+  return '<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body style="margin:0;padding:0;">'
+    + bodyHtml
+    + '</body></html>';
+}
+
 // Escapes advisor-entered message text before it goes into an email.
 // The custom birthday/anniversary bodies are free text typed in
 // Settings, so they must never be trusted as raw HTML \u2014 a stray
 // "<" or "&" would otherwise corrupt the email markup.
 function escapeHtmlForEmail(text){
-  return String(text == null ? '' : text)
+  const escaped = String(text == null ? '' : text)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/\"/g, '&quot;');
+  // Convert anything outside printable ASCII into a numeric HTML
+  // character reference -- e.g. an advisor-typed party emoji becomes
+  // literally "&#127881;", the exact same safe form already used for
+  // the hardcoded party emoji in the default templates below. This is
+  // what actually protects emoji and accented characters from being
+  // corrupted into diamond-question-mark mojibake by a mail client
+  // that ends up reading the HTML with the wrong charset -- numeric
+  // character references are pure ASCII, so there is no multi-byte
+  // sequence left for a client to misinterpret, regardless of
+  // whether it honors the declared charset correctly or not.
+  // Array.from() iterates by Unicode code point rather than by
+  // UTF-16 code unit, so a surrogate-pair emoji is read as one whole
+  // character here instead of being split into two broken halves.
+  return Array.from(escaped).map(function(ch){
+    const code = ch.codePointAt(0);
+    return code > 126 ? '&#' + code + ';' : ch;
+  }).join('');
 }
 
 // Turns a plain-text custom message into styled email paragraphs.
@@ -2982,7 +3015,7 @@ function buildBirthdayEmailHtml(fullName, config){
     ? renderCustomMessageParagraphs(config.birthdayMessage, { firstname: greetingName })
     : '<p style="font-size:14px;">' + defaultBirthdayBody + '</p>';
 
-  return ''
+  return wrapEmailHtmlDocument(''
     + '<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;border:1px solid #E7DFCF;border-radius:10px;overflow:hidden;">'
     + '  <img src="cid:headerImg" alt="Header" style="width:100%;display:block;">'
     + '  <div style="padding:24px;background:#FDF8F0;color:#1C2A38;text-align:center;">'
@@ -2992,7 +3025,7 @@ function buildBirthdayEmailHtml(fullName, config){
     + '    <p style="margin-top:20px;text-align:left;">Warm regards,</p>'
     + '  </div>'
     + '  <img src="cid:footerImg" alt="Footer" style="width:100%;display:block;">'
-    + '</div>';
+    + '</div>');
 }
 
 function previewBirthdayEmail(){
