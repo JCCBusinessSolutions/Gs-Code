@@ -63,7 +63,7 @@ const TRIGGER_CODE_VERSION = '2026-08-18-v2';
 // behind. Bump this string any time a real, user-facing Code.gs
 // change ships — and update the matching value in the hosted
 // update-status JSON at the same time, or this check does nothing.
-const CODE_GS_VERSION = '2026-09-16-v11'; // bumped: Recurring Broadcast Email feature added
+const CODE_GS_VERSION = '2026-09-16-v1'; // bumped: Recurring Broadcast Email feature added
 
 // Shared by every trigger self-heal below. Deletes any existing
 // trigger(s) for the given handler function if the stored version
@@ -1122,6 +1122,34 @@ function setBirthdayPreference(email, enabled){
 /* ============================================================
    WEB APP ENTRY POINTS
    ============================================================ */
+const TRIGGER_SELF_HEAL_THROTTLE_MS = 10 * 60 * 1000; // 10 minutes
+
+// Runs the 5 trigger self-heal checks below, but at most once every
+// TRIGGER_SELF_HEAL_THROTTLE_MS -- not on literally every single
+// request. Each check does very little real work when nothing needs
+// fixing, but it still costs a LockService.waitLock() round trip
+// every time, five separate times per request -- multiplied across
+// every list refresh, click, and poll, that adds up to real, avoidable
+// latency on every single response. Throttling this doesn't weaken
+// the self-heal guarantee: the independent hourly watchdog trigger
+// (ensureWatchdogTriggerExists) already catches anything missed within
+// an hour regardless of whether anyone opens the app at all, so
+// running this check every 10 minutes instead of on every request
+// loses nothing in practice -- it only cuts redundant lock overhead.
+function runTriggerSelfHealIfDue_(){
+  const props = PropertiesService.getScriptProperties();
+  const lastRun = Number(props.getProperty('LAST_TRIGGER_SELF_HEAL') || 0);
+  if (Date.now() - lastRun < TRIGGER_SELF_HEAL_THROTTLE_MS) return;
+
+  ensureDailyReminderTriggerExists();
+  ensureAnniversaryDailyTriggerExists();
+  ensureBirthdayDailyTriggerExists();
+  ensureWatchdogTriggerExists();
+  ensureRecurringBroadcastHourlyTriggerExists();
+
+  props.setProperty('LAST_TRIGGER_SELF_HEAL', String(Date.now()));
+}
+
 function doGet(e){
   const action = e.parameter.action;
   if (action === 'getAdvisorActiveStatus')    return jsonResponse(getAdvisorActiveStatus());
@@ -1131,20 +1159,14 @@ function doGet(e){
   if (!PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID')){
     return jsonResponse({ error: 'SHEET_NOT_CONFIGURED', message: 'Run ?action=setSpreadsheetId&id=YOUR_SHEET_ID first.' });
   }
-  // Self-heals the dues + anniversary triggers on EVERY single request,
-  // not just ones that happen to call setupSheet() — previously a
-  // missing/silently-deleted trigger could sit broken for days until
-  // something specific (like an upload) happened to touch it. This has
+  // Self-heals the dues + anniversary triggers, throttled to run at
+  // most once every 10 minutes rather than on literally every request
+  // (see runTriggerSelfHealIfDue_ above for why that's safe) — this has
   // been the recurring root cause behind several days of "advance
-  // reminders didn't fire" investigations, none of which ever found a
-  // logic bug — because the trigger simply wasn't there to run. This
-  // check is cheap (just enumerating triggers, no Sheet access), so
-  // running it unconditionally here is worth the guarantee.
-  ensureDailyReminderTriggerExists();
-  ensureAnniversaryDailyTriggerExists();
-  ensureBirthdayDailyTriggerExists();
-  ensureWatchdogTriggerExists(); // second, independent layer — catches a missing trigger within an hour even on a day nobody opens the app
-  ensureRecurringBroadcastHourlyTriggerExists();
+  // reminders didn't fire" investigations in the past, none of which
+  // ever found a logic bug, because the trigger simply wasn't there
+  // to run.
+  runTriggerSelfHealIfDue_();
   if (!ACTIONS_EXEMPT_FROM_HARD_STOP.includes(action) && !isAdvisorActive()){
     return jsonResponse(Object.assign({ error: 'ADVISOR_INACTIVE' }, getAdvisorActiveStatus()));
   }
@@ -1359,13 +1381,8 @@ function doPost(e){
     return jsonResponse({ error: 'SHEET_NOT_CONFIGURED', message: 'Run ?action=setSpreadsheetId&id=YOUR_SHEET_ID first.' });
   }
 
-  // Same self-heal as doGet — every POST request also re-verifies these
-  // triggers exist, not just ones that happen to call setupSheet().
-  ensureDailyReminderTriggerExists();
-  ensureAnniversaryDailyTriggerExists();
-  ensureBirthdayDailyTriggerExists();
-  ensureWatchdogTriggerExists();
-  ensureRecurringBroadcastHourlyTriggerExists();
+  // Same self-heal as doGet, same throttling (see runTriggerSelfHealIfDue_).
+  runTriggerSelfHealIfDue_();
 
   if (!ACTIONS_EXEMPT_FROM_HARD_STOP.includes(body.action) && !isAdvisorActive()){
     return jsonResponse(Object.assign({ error: 'ADVISOR_INACTIVE' }, getAdvisorActiveStatus()));
@@ -1394,6 +1411,7 @@ function doPost(e){
   if (body.action === 'deleteCompletedBroadcast') { try{ return jsonResponse(deleteCompletedBroadcast(body.scheduleId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'annotateResendOnSchedule') { try{ return jsonResponse(annotateResendOnSchedule(body.scheduleId, body.sentCount, body.failedCount)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'getScheduledBroadcasts') { try{ return jsonResponse({ schedules: getScheduledBroadcasts() }); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
+  if (body.action === 'getSchedulePayload')     { try{ return jsonResponse(getSchedulePayload(body.scheduleId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'createRecurringBroadcast') { try{ return jsonResponse(createRecurringBroadcast(body.frequency, body.anchorDate, body.payload)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'getRecurringBroadcasts')   { try{ return jsonResponse({ campaigns: getRecurringBroadcasts() }); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'pauseRecurringBroadcast')  { try{ return jsonResponse(setRecurringBroadcastStatus(body.recurringId, 'paused')); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
@@ -1402,6 +1420,7 @@ function doPost(e){
   if (body.action === 'testSendRecurringBroadcast') { try{ return jsonResponse(testSendRecurringBroadcast(body.recurringId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'saveDraft')              { try{ return jsonResponse(saveDraft(body.draftId, body.payload)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'getDrafts')              { try{ return jsonResponse({ drafts: getDrafts() }); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
+  if (body.action === 'getDraftPayload')        { try{ return jsonResponse(getDraftPayload(body.draftId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'deleteDraft')            { try{ return jsonResponse(deleteDraft(body.draftId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'manualSendDuesNow')          { try{ return jsonResponse(manualSendDuesNow()); }catch(err){ return jsonResponse({ success:false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'manualSendBirthdaysNow')     { try{ return jsonResponse(manualSendBirthdaysNow()); }catch(err){ return jsonResponse({ success:false, error: toEnglishErrorMessage(err.message) }); } }
@@ -2763,6 +2782,13 @@ function runScheduledBroadcastTrigger(e){
   }
 }
 
+// Lightweight list only \u2014 same fix as getDrafts above, and for the
+// same reason: this feeds BOTH the Scheduled and Completed sections at
+// once, and Completed accumulates indefinitely unless deleted, so this
+// was the single largest source of wasted payload transfer on the
+// whole Broadcast page. getSchedulePayload (below) fetches the real
+// content for exactly one schedule, only when Resend/Edit & Resend is
+// actually clicked.
 function getScheduledBroadcasts(){
   const sheet = setupScheduleSheet();
   const data = sheet.getDataRange().getValues();
@@ -2780,12 +2806,26 @@ function getScheduledBroadcasts(){
       sentAt: row[col('Sent At')] instanceof Date ? row[col('Sent At')].toISOString() : String(row[col('Sent At')] || ''),
       error: row[col('Error')] || '',
       sentCount: Number(row[col('SentCount')]) || 0,
-      failedCount: Number(row[col('FailedCount')]) || 0,
-      payload: JSON.parse(row[col('PayloadJSON')] || '{}')
+      failedCount: Number(row[col('FailedCount')]) || 0
     });
   }
   result.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   return result;
+}
+
+// Full payload for exactly ONE schedule \u2014 called only when Resend or
+// Edit & Resend is actually clicked, not as part of the list.
+function getSchedulePayload(scheduleId){
+  const sheet = setupScheduleSheet();
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const col = name => headers.indexOf(name);
+  for (let i = 1; i < data.length; i++){
+    if (String(data[i][col('Schedule ID')]) === String(scheduleId)){
+      return { success: true, scheduleId: scheduleId, payload: JSON.parse(data[i][col('PayloadJSON')] || '{}') };
+    }
+  }
+  return { success: false, error: 'Schedule not found.' };
 }
 
 function cancelScheduledBroadcast(scheduleId){
@@ -3207,6 +3247,15 @@ function saveDraft(draftId, payload){
   return { success: true, draftId: newDraftId };
 }
 
+// Lightweight list only \u2014 subject and dates, NOT the full payload.
+// The drafts list view only ever displays a title and a date; the full
+// htmlBody plus every attachment's base64 data (which is what
+// PayloadJSON actually holds) was previously sent back for every
+// single draft on every list load, even though nothing in the list
+// view uses any of it. With even a few drafts carrying attachments or
+// inline images, that's megabytes transferred and parsed just to show
+// a list of titles. getDraftPayload (below) fetches the real content
+// for exactly one draft, only when it's actually opened.
 function getDrafts(){
   const sheet = setupDraftSheet();
   const data = sheet.getDataRange().getValues();
@@ -3218,13 +3267,27 @@ function getDrafts(){
     result.push({
       draftId: row[col('Draft ID')],
       subject: row[col('Subject')],
-      payload: JSON.parse(row[col('PayloadJSON')] || '{}'),
       createdAt: row[col('Created At')] instanceof Date ? row[col('Created At')].toISOString() : String(row[col('Created At')]),
       updatedAt: row[col('Updated At')] instanceof Date ? row[col('Updated At')].toISOString() : String(row[col('Updated At')])
     });
   }
   result.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
   return result;
+}
+
+// Full payload for exactly ONE draft \u2014 called only when that specific
+// draft is opened for editing, not as part of the list.
+function getDraftPayload(draftId){
+  const sheet = setupDraftSheet();
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const col = name => headers.indexOf(name);
+  for (let i = 1; i < data.length; i++){
+    if (String(data[i][col('Draft ID')]) === String(draftId)){
+      return { success: true, draftId: draftId, payload: JSON.parse(data[i][col('PayloadJSON')] || '{}') };
+    }
+  }
+  return { success: false, error: 'Draft not found.' };
 }
 
 function deleteDraft(draftId){
