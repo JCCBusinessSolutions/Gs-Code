@@ -63,7 +63,7 @@ const TRIGGER_CODE_VERSION = '2026-08-18-v2';
 // behind. Bump this string any time a real, user-facing Code.gs
 // change ships — and update the matching value in the hosted
 // update-status JSON at the same time, or this check does nothing.
-const CODE_GS_VERSION = '2026-09-16-v1'; // bumped: Recurring Broadcast Email feature added
+const CODE_GS_VERSION = '2026-09-16-v12'; // removed Edit Recurring Campaign (getRecurringPayload/updateRecurringBroadcast) and the diagnostic doPost wrapper
 
 // Shared by every trigger self-heal below. Deletes any existing
 // trigger(s) for the given handler function if the stored version
@@ -1418,8 +1418,6 @@ function doPost(e){
   if (body.action === 'resumeRecurringBroadcast') { try{ return jsonResponse(setRecurringBroadcastStatus(body.recurringId, 'active')); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'deleteRecurringBroadcast') { try{ return jsonResponse(deleteRecurringBroadcast(body.recurringId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'testSendRecurringBroadcast') { try{ return jsonResponse(testSendRecurringBroadcast(body.recurringId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
-  if (body.action === 'getRecurringPayload')      { try{ return jsonResponse(getRecurringPayload(body.recurringId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
-  if (body.action === 'updateRecurringBroadcast') { try{ return jsonResponse(updateRecurringBroadcast(body.recurringId, body.frequency, body.anchorDate, body.payload)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'saveDraft')              { try{ return jsonResponse(saveDraft(body.draftId, body.payload)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'getDrafts')              { try{ return jsonResponse({ drafts: getDrafts() }); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
   if (body.action === 'getDraftPayload')        { try{ return jsonResponse(getDraftPayload(body.draftId)); }catch(err){ return jsonResponse({ success: false, error: toEnglishErrorMessage(err.message) }); } }
@@ -3123,78 +3121,6 @@ function testSendRecurringBroadcast(recurringId){
         throw new Error(batchResult.failureReasons[0].reason);
       }
       return { success: true, sentTo: recipient };
-    }
-  }
-  return { success: false, error: 'Recurring campaign not found.' };
-}
-
-// Full payload for exactly ONE recurring campaign \u2014 called only when
-// Edit is actually clicked, same on-demand pattern as getDraftPayload
-// and getSchedulePayload. The list itself (getRecurringBroadcasts)
-// never carries this, so opening the list stays exactly as fast as it
-// already is regardless of how many campaigns exist or how large their
-// messages are.
-function getRecurringPayload(recurringId){
-  const sheet = setupRecurringSheet();
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const col = name => headers.indexOf(name);
-  for (let i = 1; i < data.length; i++){
-    if (String(data[i][col('Recurring ID')]) === String(recurringId)){
-      return {
-        success: true,
-        recurringId: recurringId,
-        payload: JSON.parse(data[i][col('PayloadJSON')] || '{}'),
-        frequency: data[i][col('Frequency')],
-        anchorDate: data[i][col('Anchor Date')] instanceof Date ? data[i][col('Anchor Date')].toISOString() : String(data[i][col('Anchor Date')] || '')
-      };
-    }
-  }
-  return { success: false, error: 'Recurring campaign not found.' };
-}
-
-// Updates content, frequency, and/or anchor date/time for an existing
-// recurring campaign. Never touches triggers \u2014 recurring campaigns
-// never had a per-campaign trigger to begin with (see the 20-trigger
-// note on RECURRING_SHEET_NAME above), so editing one has zero effect
-// on trigger count or the hourly check's runtime either way.
-//
-// Next Send Date is always recalculated from the (possibly new) anchor
-// and frequency, regardless of whether the campaign is currently
-// active or paused \u2014 same reasoning as setRecurringBroadcastStatus's
-// resume path: keeps "next send" accurate at all times rather than
-// showing a stale value until the advisor happens to resume it.
-//
-// Last Error is cleared on every edit. An edit is usually the advisor
-// fixing whatever was failing (a broken image, missing branding,
-// oversized attachment), so carrying the old error forward would be
-// actively misleading \u2014 it would still show even after the actual
-// problem was fixed.
-function updateRecurringBroadcast(recurringId, frequency, anchorDateIso, payload){
-  if (['daily','weekly','monthly','quarterly','annually'].indexOf(frequency) === -1){
-    throw new Error('Invalid frequency: ' + frequency);
-  }
-  const anchorDate = new Date(anchorDateIso);
-  if (isNaN(anchorDate.getTime())) throw new Error('Invalid anchor date.');
-
-  const sheet = setupRecurringSheet();
-  const data = sheet.getDataRange().getValues();
-  const headers = data[0];
-  const col = name => headers.indexOf(name);
-
-  for (let i = 1; i < data.length; i++){
-    if (String(data[i][col('Recurring ID')]) === String(recurringId)){
-      const rowNum = i + 1;
-      const newNextSend = computeNextSendDate_(anchorDate, frequency, new Date());
-
-      sheet.getRange(rowNum, col('Subject') + 1).setValue(payload && payload.subject || '');
-      sheet.getRange(rowNum, col('PayloadJSON') + 1).setValue(JSON.stringify(payload || {}));
-      sheet.getRange(rowNum, col('Frequency') + 1).setValue(frequency);
-      sheet.getRange(rowNum, col('Anchor Date') + 1).setValue(anchorDate);
-      sheet.getRange(rowNum, col('Next Send Date') + 1).setValue(newNextSend);
-      sheet.getRange(rowNum, col('Last Error') + 1).setValue('');
-
-      return { success: true, nextSendDate: newNextSend.toISOString() };
     }
   }
   return { success: false, error: 'Recurring campaign not found.' };
